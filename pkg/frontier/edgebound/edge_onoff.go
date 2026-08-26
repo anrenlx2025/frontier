@@ -1,12 +1,9 @@
 package edgebound
 
 import (
-	"errors"
 	"net"
-	"strconv"
 	"time"
 
-	"github.com/jumboframes/armorigo/synchub"
 	"github.com/singchia/frontier/pkg/frontier/apis"
 	"github.com/singchia/frontier/pkg/frontier/repo/model"
 	"github.com/singchia/frontier/pkg/frontier/repo/query"
@@ -18,41 +15,40 @@ import (
 func (em *edgeManager) online(end geminio.End) error {
 	// TODO transaction
 	// cache
-	var sync synchub.Sync
-	em.mtx.RLock()
+	em.mtx.Lock()
 	old, ok := em.edges[end.ClientID()]
 	if ok {
 		klog.Warningf("edge online, old end exists, edgeID: %d", end.ClientID())
-		// if the old connection exits, offline it
-		oldend := old.(geminio.End)
-		// we wait the cache and db to clear old end's data
-		syncKey := "edge" + "-" + strconv.FormatUint(oldend.ClientID(), 10) + "-" + oldend.RemoteAddr().String()
-		sync = em.shub.Add(syncKey)
-		if err := oldend.Close(); err != nil {
-			klog.Warningf("edge online, kick off old end err: %s, edgeID: %d", err, end.ClientID())
-		}
-	}
-	em.mtx.RUnlock()
-
-	// we don't want the channel block the mtx
-	if sync != nil {
-		// unlikely here
-		<-sync.C()
-	}
-
-	em.mtx.Lock()
-	// double check
-	old, ok = em.edges[end.ClientID()]
-	if ok {
-		klog.Warningf("edge online same time, old end exists, edgeID: %d", end.ClientID())
-		em.mtx.Unlock()
-		return errors.New("please connect later")
+		// 踢旧端同步化：同一把写锁内原子完成旧端本地逐出与新 end 上位，
+		// 不再等待 offline 通知链完成。依据：死链旧 end 的 ConnOffline 可能
+		// 永不到达（其包处理循环已死，Close 不会触发 delegate 回调），
+		// 等待链在僵尸场景下永久失效，重连将持续撞上僵尸 end（churn 自持）。
+		// 迟到的旧端 offline 因 addr 不匹配走无害分支，不会逐出新 end。
+		delete(em.edges, end.ClientID())
 	}
 	em.edges[end.ClientID()] = end
 	if em.informer != nil {
 		em.informer.SetEdgeCount(len(em.edges))
 	}
 	em.mtx.Unlock()
+
+	if ok {
+		oldend := old.(geminio.End)
+		if err := oldend.Close(); err != nil {
+			klog.Warningf("edge online, kick off old end err: %s, edgeID: %d", err, end.ClientID())
+		}
+		// memdb：清理旧端残留的 RPC 注册与旧行，防止 stale 路由和 sqlite 后端下的主键冲突。
+		// 清理失败仅记录不阻断——不应因清理失败拒绝新端上线。
+		if err := em.repo.DeleteEdge(&query.EdgeDelete{
+			EdgeID: end.ClientID(),
+			Addr:   oldend.RemoteAddr().String(),
+		}); err != nil {
+			klog.Errorf("edge online, repo delete old edge err: %s, edgeID: %d", err, end.ClientID())
+		}
+		if err := em.repo.DeleteEdgeRPCs(end.ClientID()); err != nil {
+			klog.Errorf("edge online, repo delete edge rpcs err: %s, edgeID: %d", err, end.ClientID())
+		}
+	}
 
 	// memdb
 	edge := &model.Edge{
@@ -76,14 +72,12 @@ func (em *edgeManager) online(end geminio.End) error {
 
 func (em *edgeManager) offline(edgeID uint64, meta []byte, addr net.Addr) error {
 	// TODO transaction
-	legacy := false
 	// cache
 	em.mtx.Lock()
 	value, ok := em.edges[edgeID]
 	if ok {
 		end := value.(geminio.End)
 		if end.RemoteAddr().String() == addr.String() {
-			legacy = true
 			delete(em.edges, edgeID)
 			klog.V(2).Infof("edge offline, edgeID: %d, remote addr: %s", edgeID, end.RemoteAddr().String())
 		} else {
@@ -100,13 +94,6 @@ func (em *edgeManager) offline(edgeID uint64, meta []byte, addr net.Addr) error 
 		em.informer.SetEdgeCount(len(em.edges))
 	}
 	em.mtx.Unlock()
-
-	defer func() {
-		if legacy {
-			syncKey := "edge" + "-" + strconv.FormatUint(edgeID, 10) + "-" + addr.String()
-			em.shub.Done(syncKey)
-		}
-	}()
 
 	// memdb
 	if err := em.repo.DeleteEdge(&query.EdgeDelete{

@@ -2,6 +2,7 @@ package edgebound
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"math/rand"
 	"net"
@@ -9,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/jumboframes/armorigo/rproxy"
-	"github.com/jumboframes/armorigo/synchub"
 	"github.com/singchia/frontier/pkg/frontier/apis"
 	"github.com/singchia/frontier/pkg/frontier/config"
 	"github.com/singchia/frontier/pkg/frontier/misc"
@@ -38,7 +38,6 @@ type edgeManager struct {
 
 	// edgeID allocator
 	idFactory id.IDFactory
-	shub      *synchub.SyncHub
 	// cache
 	// key: edgeID; value: geminio.End
 	// edges sync.Map
@@ -69,7 +68,6 @@ func newEdgeManager(conf *config.Configuration, repo apis.Repo, informer apis.Ed
 		tmr:                   tmr,
 		streams:               mapmap.NewMapMap(),
 		repo:                  repo,
-		shub:                  synchub.NewSyncHub(synchub.OptionTimer(tmr)),
 		edges:                 make(map[uint64]geminio.End),
 		UnimplementedDelegate: &delegate.UnimplementedDelegate{},
 		// a simple unix timestamp incemental id factory
@@ -138,7 +136,29 @@ func (em *edgeManager) Serve() error {
 	return nil
 }
 
+// underlyingTCPConn 解开 TLS 包装取出底层 *net.TCPConn，非 TCP 连接返回 nil
+func underlyingTCPConn(conn net.Conn) *net.TCPConn {
+	switch c := conn.(type) {
+	case *net.TCPConn:
+		return c
+	case *tls.Conn:
+		if tcp, ok := c.NetConn().(*net.TCPConn); ok {
+			return tcp
+		}
+	}
+	return nil
+}
+
 func (em *edgeManager) handleConn(conn net.Conn) error {
+	// 对 edge 连接显式启用 TCP keepalive：直连拓扑下由内核探测半开连接，
+	// 尽早退出 read 循环触发 offline 清理；TCP 终止型反代拓扑下对端恒为反代，
+	// 探测在反代段被应答、不产生检测效果，仅作为直连场景的正确默认行为。
+	if tcpConn := underlyingTCPConn(conn); tcpConn != nil {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			klog.V(2).Infof("edge manager set keepalive err: %s, addr: %s", err, conn.RemoteAddr())
+		}
+	}
+
 	// options for geminio End
 	opt := server.NewEndOptions()
 	opt.SetTimer(em.tmr)
